@@ -1,0 +1,10 @@
+{application, opentelemetry_shigoto, [
+    {description, "OpenTelemetry instrumentation for Shigoto background job system"},
+    {vsn, "git"},
+    {registered, []},
+    {applications, [kernel, stdlib, telemetry, opentelemetry_api]},
+    {env, []},
+    {modules, []},
+    {licenses, ["MIT"]},
+    {links, [{"GitHub", "https://github.com/Taure/opentelemetry_shigoto"}]}
+]}.
