@@ -18,5 +18,6 @@ jobs:
       enable-audit: true
       enable-coverage: true
       enable-sbom: true
+      enable-sbom-scan: true
       enable-dependency-submission: true
       enable-summary: true
