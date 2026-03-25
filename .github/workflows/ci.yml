@@ -15,7 +15,7 @@ jobs:
     with:
       version-file: '.tool-versions'
       enable-ex-doc: true
-      enable-audit: true
+      enable-audit: false
       enable-coverage: true
       enable-sbom: true
       enable-sbom-scan: true

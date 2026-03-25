@@ -73,7 +73,6 @@ handle_event([shigoto, job, completed], Measurements, Metadata, Opts) ->
     StartTime = EndTime - erlang:convert_time_unit(DurationMs, millisecond, nanosecond),
     otel_span:set_attribute(Ctx, ~"shigoto.start_time", StartTime),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, job, failed], Measurements, Metadata, Opts) ->
     Tracer = tracer(),
     SpanName = span_name(<<"job.execute">>, Metadata, Opts),
@@ -85,7 +84,6 @@ handle_event([shigoto, job, failed], Measurements, Metadata, Opts) ->
     }),
     otel_span:set_status(Ctx, ?OTEL_STATUS_ERROR, Reason),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, job, inserted], _Measurements, Metadata, Opts) ->
     Tracer = tracer(),
     SpanName = span_name(<<"job.insert">>, Metadata, Opts),
@@ -100,7 +98,6 @@ handle_event([shigoto, job, inserted], _Measurements, Metadata, Opts) ->
         attributes => Attributes
     }),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, job, claimed], Measurements, Metadata, _Opts) ->
     Tracer = tracer(),
     QueueWait = maps:get(queue_wait_ms, Measurements, 0),
@@ -115,7 +112,6 @@ handle_event([shigoto, job, claimed], Measurements, Metadata, _Opts) ->
         attributes => Attributes
     }),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, job, snoozed], _Measurements, Metadata, _Opts) ->
     Tracer = tracer(),
     Reason = maps:get(snooze_reason, Metadata, <<>>),
@@ -128,7 +124,6 @@ handle_event([shigoto, job, snoozed], _Measurements, Metadata, _Opts) ->
         }
     }),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, job, discarded], _Measurements, Metadata, _Opts) ->
     Tracer = tracer(),
     Ctx = otel_tracer:start_span(Tracer, <<"shigoto.job.discard">>, #{
@@ -141,7 +136,6 @@ handle_event([shigoto, job, discarded], _Measurements, Metadata, _Opts) ->
     }),
     otel_span:set_status(Ctx, ?OTEL_STATUS_ERROR, <<"discarded">>),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, job, cancelled], _Measurements, Metadata, _Opts) ->
     Tracer = tracer(),
     Ctx = otel_tracer:start_span(Tracer, <<"shigoto.job.cancel">>, #{
@@ -152,7 +146,6 @@ handle_event([shigoto, job, cancelled], _Measurements, Metadata, _Opts) ->
         }
     }),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, queue, poll], Measurements, Metadata, _Opts) ->
     Tracer = tracer(),
     Ctx = otel_tracer:start_span(Tracer, <<"shigoto.queue.poll">>, #{
@@ -163,7 +156,6 @@ handle_event([shigoto, queue, poll], Measurements, Metadata, _Opts) ->
         }
     }),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, queue, paused], _Measurements, Metadata, _Opts) ->
     Tracer = tracer(),
     Ctx = otel_tracer:start_span(Tracer, <<"shigoto.queue.pause">>, #{
@@ -171,7 +163,6 @@ handle_event([shigoto, queue, paused], _Measurements, Metadata, _Opts) ->
         attributes => #{~"shigoto.queue" => maps:get(queue, Metadata, <<>>)}
     }),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, queue, resumed], _Measurements, Metadata, _Opts) ->
     Tracer = tracer(),
     Ctx = otel_tracer:start_span(Tracer, <<"shigoto.queue.resume">>, #{
@@ -179,7 +170,6 @@ handle_event([shigoto, queue, resumed], _Measurements, Metadata, _Opts) ->
         attributes => #{~"shigoto.queue" => maps:get(queue, Metadata, <<>>)}
     }),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, resilience, rate_limited], Measurements, Metadata, _Opts) ->
     Tracer = tracer(),
     Ctx = otel_tracer:start_span(Tracer, <<"shigoto.resilience.rate_limited">>, #{
@@ -190,7 +180,6 @@ handle_event([shigoto, resilience, rate_limited], Measurements, Metadata, _Opts)
         }
     }),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, resilience, circuit_open], _Measurements, Metadata, _Opts) ->
     Tracer = tracer(),
     Ctx = otel_tracer:start_span(Tracer, <<"shigoto.resilience.circuit_open">>, #{
@@ -199,7 +188,6 @@ handle_event([shigoto, resilience, circuit_open], _Measurements, Metadata, _Opts
     }),
     otel_span:set_status(Ctx, ?OTEL_STATUS_ERROR, <<"circuit_open">>),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, resilience, bulkhead_full], _Measurements, Metadata, _Opts) ->
     Tracer = tracer(),
     Ctx = otel_tracer:start_span(Tracer, <<"shigoto.resilience.bulkhead_full">>, #{
@@ -207,7 +195,6 @@ handle_event([shigoto, resilience, bulkhead_full], _Measurements, Metadata, _Opt
         attributes => #{~"shigoto.worker" => to_binary(maps:get(worker, Metadata, <<>>))}
     }),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, resilience, load_shed], _Measurements, Metadata, _Opts) ->
     Tracer = tracer(),
     Ctx = otel_tracer:start_span(Tracer, <<"shigoto.resilience.load_shed">>, #{
@@ -215,7 +202,6 @@ handle_event([shigoto, resilience, load_shed], _Measurements, Metadata, _Opts) -
         attributes => #{~"shigoto.priority" => maps:get(priority, Metadata, 0)}
     }),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, batch, completed], _Measurements, Metadata, _Opts) ->
     Tracer = tracer(),
     Ctx = otel_tracer:start_span(Tracer, <<"shigoto.batch.complete">>, #{
@@ -228,7 +214,6 @@ handle_event([shigoto, batch, completed], _Measurements, Metadata, _Opts) ->
         }
     }),
     otel_span:end_span(Ctx);
-
 handle_event([shigoto, cron, scheduled], _Measurements, Metadata, _Opts) ->
     Tracer = tracer(),
     Ctx = otel_tracer:start_span(Tracer, <<"shigoto.cron.schedule">>, #{
@@ -240,7 +225,6 @@ handle_event([shigoto, cron, scheduled], _Measurements, Metadata, _Opts) ->
         }
     }),
     otel_span:end_span(Ctx);
-
 handle_event(_Event, _Measurements, _Metadata, _Opts) ->
     ok.
 
