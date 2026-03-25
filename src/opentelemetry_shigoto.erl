@@ -1,238 +1,276 @@
 -module(opentelemetry_shigoto).
 -moduledoc """
-OpenTelemetry instrumentation for Shigoto.
+OpenTelemetry instrumentation for Shigoto background jobs.
 
-Subscribes to Shigoto's telemetry events and creates OpenTelemetry spans
-for job execution, insertion, and lifecycle events.
+Subscribes to Shigoto's telemetry events and creates OTel spans
+and metrics for job execution, queue operations, and resilience.
+
+## Setup
 
 ```erlang
-%% In your application's start/2
 opentelemetry_shigoto:setup().
 ```
 
-## Spans
+Or with options:
 
-- `shigoto.job.execute` — Job execution (completed or failed). Includes
-  execution duration, worker, queue, attempt, and error status on failure.
-- `shigoto.job.insert` — Job insertion.
-- `shigoto.job.snooze` — Job snoozed (rate limited, circuit open, etc.).
-- `shigoto.job.discard` — Job permanently discarded after max attempts.
-- `shigoto.job.cancel` — Job cancelled.
-- `shigoto.batch.complete` — All jobs in a batch finished.
-
-## Attributes
-
-All spans include:
-- `shigoto.job.id` — Job ID
-- `shigoto.job.worker` — Worker module name
-- `shigoto.job.queue` — Queue name
-- `shigoto.job.attempt` — Current attempt number
-
-Execution spans additionally include:
-- `shigoto.job.duration_ms` — Execution duration in milliseconds
-
-Failed spans set `OTEL_STATUS_ERROR` with the error reason.
+```erlang
+opentelemetry_shigoto:setup(#{
+    span_prefix => <<"shigoto">>
+}).
+```
 """.
 
 -export([setup/0, setup/1]).
--export([
-    handle_completed/4,
-    handle_failed/4,
-    handle_inserted/4,
-    handle_snoozed/4,
-    handle_discarded/4,
-    handle_cancelled/4,
-    handle_batch_completed/4
-]).
--export([format_worker/1, span_name/2]).
 
 -include_lib("opentelemetry_api/include/opentelemetry.hrl").
 
--doc "Attach all telemetry handlers with default options.".
+-define(HANDLER_ID, opentelemetry_shigoto).
+
+-doc "Set up OpenTelemetry instrumentation with default options.".
 -spec setup() -> ok.
 setup() ->
     setup(#{}).
 
--doc """
-Attach all telemetry handlers with options.
-
-Options:
-- `job_system` — Job system name (default: `<<"shigoto">>`)
-""".
+-doc "Set up OpenTelemetry instrumentation with options.".
 -spec setup(map()) -> ok.
 setup(Opts) ->
-    Handlers = [
-        {<<"otel-shigoto-completed">>, [shigoto, job, completed], fun ?MODULE:handle_completed/4},
-        {<<"otel-shigoto-failed">>, [shigoto, job, failed], fun ?MODULE:handle_failed/4},
-        {<<"otel-shigoto-inserted">>, [shigoto, job, inserted], fun ?MODULE:handle_inserted/4},
-        {<<"otel-shigoto-snoozed">>, [shigoto, job, snoozed], fun ?MODULE:handle_snoozed/4},
-        {<<"otel-shigoto-discarded">>, [shigoto, job, discarded], fun ?MODULE:handle_discarded/4},
-        {<<"otel-shigoto-cancelled">>, [shigoto, job, cancelled], fun ?MODULE:handle_cancelled/4},
-        {<<"otel-shigoto-batch-completed">>, [shigoto, batch, completed],
-            fun ?MODULE:handle_batch_completed/4}
+    Events = [
+        [shigoto, job, completed],
+        [shigoto, job, failed],
+        [shigoto, job, inserted],
+        [shigoto, job, claimed],
+        [shigoto, job, snoozed],
+        [shigoto, job, discarded],
+        [shigoto, job, cancelled],
+        [shigoto, queue, poll],
+        [shigoto, queue, paused],
+        [shigoto, queue, resumed],
+        [shigoto, resilience, rate_limited],
+        [shigoto, resilience, circuit_open],
+        [shigoto, resilience, bulkhead_full],
+        [shigoto, resilience, load_shed],
+        [shigoto, batch, completed],
+        [shigoto, cron, scheduled]
     ],
-    lists:foreach(
-        fun({Id, Event, Handler}) ->
-            telemetry:attach(Id, Event, Handler, Opts)
-        end,
-        Handlers
-    ),
+    telemetry:attach_many(?HANDLER_ID, Events, fun handle_event/4, Opts),
     ok.
 
 %%----------------------------------------------------------------------
-%% Handlers
+%% Telemetry handlers
 %%----------------------------------------------------------------------
 
--doc false.
-handle_completed(_Event, #{duration := Duration}, Metadata, Config) ->
-    Attributes = job_attributes(Metadata, Config),
-    DurationMs = erlang:convert_time_unit(Duration, native, millisecond),
-    Attributes1 = Attributes#{'shigoto.job.duration_ms' => DurationMs},
-    SpanName = span_name(<<"execute">>, Metadata),
-    StartTime = opentelemetry:timestamp() - Duration,
-    SpanCtx = otel_tracer:start_span(
-        opentelemetry:get_application_tracer(?MODULE),
-        SpanName,
-        #{
-            start_time => StartTime,
-            kind => ?SPAN_KIND_CONSUMER,
-            attributes => Attributes1
-        }
-    ),
-    otel_span:end_span(SpanCtx, opentelemetry:timestamp()),
-    ok;
-handle_completed(_Event, _Measurements, _Metadata, _Config) ->
-    ok.
+handle_event([shigoto, job, completed], Measurements, Metadata, Opts) ->
+    Tracer = tracer(),
+    SpanName = span_name(<<"job.execute">>, Metadata, Opts),
+    DurationMs = maps:get(duration_ms, Measurements, 0),
+    Attributes = job_attributes(Metadata, Measurements),
+    Ctx = otel_tracer:start_span(Tracer, SpanName, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => Attributes
+    }),
+    otel_span:set_status(Ctx, ?OTEL_STATUS_OK, <<>>),
+    EndTime = opentelemetry:timestamp(),
+    StartTime = EndTime - erlang:convert_time_unit(DurationMs, millisecond, nanosecond),
+    otel_span:set_attribute(Ctx, ~"shigoto.start_time", StartTime),
+    otel_span:end_span(Ctx);
 
--doc false.
-handle_failed(_Event, #{duration := Duration}, Metadata, Config) ->
-    Attributes = job_attributes(Metadata, Config),
-    DurationMs = erlang:convert_time_unit(Duration, native, millisecond),
-    Attributes1 = Attributes#{'shigoto.job.duration_ms' => DurationMs},
+handle_event([shigoto, job, failed], Measurements, Metadata, Opts) ->
+    Tracer = tracer(),
+    SpanName = span_name(<<"job.execute">>, Metadata, Opts),
     Reason = maps:get(reason, Metadata, <<"unknown">>),
-    SpanName = span_name(<<"execute">>, Metadata),
-    StartTime = opentelemetry:timestamp() - Duration,
-    SpanCtx = otel_tracer:start_span(
-        opentelemetry:get_application_tracer(?MODULE),
-        SpanName,
-        #{
-            start_time => StartTime,
-            kind => ?SPAN_KIND_CONSUMER,
-            attributes => Attributes1
-        }
-    ),
-    ErrorMsg = format_error(Reason),
-    otel_span:set_status(SpanCtx, ?OTEL_STATUS_ERROR, ErrorMsg),
-    otel_span:end_span(SpanCtx, opentelemetry:timestamp()),
-    ok;
-handle_failed(_Event, _Measurements, _Metadata, _Config) ->
-    ok.
+    Attributes = job_attributes(Metadata, Measurements),
+    Ctx = otel_tracer:start_span(Tracer, SpanName, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => Attributes#{~"error.message" => Reason}
+    }),
+    otel_span:set_status(Ctx, ?OTEL_STATUS_ERROR, Reason),
+    otel_span:end_span(Ctx);
 
--doc false.
-handle_inserted(_Event, _Measurements, Metadata, Config) ->
-    Attributes = job_attributes(Metadata, Config),
-    SpanName = span_name(<<"insert">>, Metadata),
-    SpanCtx = otel_tracer:start_span(
-        opentelemetry:get_application_tracer(?MODULE),
-        SpanName,
-        #{kind => ?SPAN_KIND_PRODUCER, attributes => Attributes}
-    ),
-    otel_span:end_span(SpanCtx, opentelemetry:timestamp()),
-    ok.
-
--doc false.
-handle_snoozed(_Event, _Measurements, Metadata, Config) ->
-    Attributes0 = job_attributes(Metadata, Config),
-    SnoozeReason = maps:get(snooze_reason, Metadata, <<"unknown">>),
-    Attributes = Attributes0#{'shigoto.job.snooze_reason' => SnoozeReason},
-    SpanName = span_name(<<"snooze">>, Metadata),
-    SpanCtx = otel_tracer:start_span(
-        opentelemetry:get_application_tracer(?MODULE),
-        SpanName,
-        #{kind => ?SPAN_KIND_CONSUMER, attributes => Attributes}
-    ),
-    otel_span:end_span(SpanCtx, opentelemetry:timestamp()),
-    ok.
-
--doc false.
-handle_discarded(_Event, _Measurements, Metadata, Config) ->
-    Attributes = job_attributes(Metadata, Config),
-    SpanName = span_name(<<"discard">>, Metadata),
-    SpanCtx = otel_tracer:start_span(
-        opentelemetry:get_application_tracer(?MODULE),
-        SpanName,
-        #{kind => ?SPAN_KIND_CONSUMER, attributes => Attributes}
-    ),
-    otel_span:set_status(SpanCtx, ?OTEL_STATUS_ERROR, <<"job discarded">>),
-    otel_span:end_span(SpanCtx, opentelemetry:timestamp()),
-    ok.
-
--doc false.
-handle_cancelled(_Event, _Measurements, Metadata, Config) ->
-    Attributes = job_attributes(Metadata, Config),
-    SpanName = span_name(<<"cancel">>, Metadata),
-    SpanCtx = otel_tracer:start_span(
-        opentelemetry:get_application_tracer(?MODULE),
-        SpanName,
-        #{kind => ?SPAN_KIND_CONSUMER, attributes => Attributes}
-    ),
-    otel_span:end_span(SpanCtx, opentelemetry:timestamp()),
-    ok.
-
--doc false.
-handle_batch_completed(_Event, _Measurements, Metadata, Config) ->
-    JobSystem = maps:get(job_system, Config, <<"shigoto">>),
+handle_event([shigoto, job, inserted], _Measurements, Metadata, Opts) ->
+    Tracer = tracer(),
+    SpanName = span_name(<<"job.insert">>, Metadata, Opts),
     Attributes = #{
-        'shigoto.system' => JobSystem,
-        'shigoto.batch.id' => maps:get(batch_id, Metadata, undefined),
-        'shigoto.batch.total_jobs' => maps:get(total_jobs, Metadata, 0),
-        'shigoto.batch.completed_jobs' => maps:get(completed_jobs, Metadata, 0),
-        'shigoto.batch.discarded_jobs' => maps:get(discarded_jobs, Metadata, 0)
+        ~"shigoto.job_id" => maps:get(job_id, Metadata, 0),
+        ~"shigoto.worker" => to_binary(maps:get(worker, Metadata, <<>>)),
+        ~"shigoto.queue" => maps:get(queue, Metadata, <<>>),
+        ~"shigoto.priority" => maps:get(priority, Metadata, 0)
     },
-    SpanCtx = otel_tracer:start_span(
-        opentelemetry:get_application_tracer(?MODULE),
-        <<"shigoto.batch.complete">>,
-        #{kind => ?SPAN_KIND_CONSUMER, attributes => Attributes}
-    ),
-    otel_span:end_span(SpanCtx, opentelemetry:timestamp()),
+    Ctx = otel_tracer:start_span(Tracer, SpanName, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => Attributes
+    }),
+    otel_span:end_span(Ctx);
+
+handle_event([shigoto, job, claimed], Measurements, Metadata, _Opts) ->
+    Tracer = tracer(),
+    QueueWait = maps:get(queue_wait_ms, Measurements, 0),
+    Attributes = #{
+        ~"shigoto.job_id" => maps:get(job_id, Metadata, 0),
+        ~"shigoto.worker" => to_binary(maps:get(worker, Metadata, <<>>)),
+        ~"shigoto.queue" => maps:get(queue, Metadata, <<>>),
+        ~"shigoto.queue_wait_ms" => QueueWait
+    },
+    Ctx = otel_tracer:start_span(Tracer, <<"shigoto.job.claim">>, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => Attributes
+    }),
+    otel_span:end_span(Ctx);
+
+handle_event([shigoto, job, snoozed], _Measurements, Metadata, _Opts) ->
+    Tracer = tracer(),
+    Reason = maps:get(snooze_reason, Metadata, <<>>),
+    Ctx = otel_tracer:start_span(Tracer, <<"shigoto.job.snooze">>, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => #{
+            ~"shigoto.job_id" => maps:get(job_id, Metadata, 0),
+            ~"shigoto.worker" => to_binary(maps:get(worker, Metadata, <<>>)),
+            ~"shigoto.snooze_reason" => Reason
+        }
+    }),
+    otel_span:end_span(Ctx);
+
+handle_event([shigoto, job, discarded], _Measurements, Metadata, _Opts) ->
+    Tracer = tracer(),
+    Ctx = otel_tracer:start_span(Tracer, <<"shigoto.job.discard">>, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => #{
+            ~"shigoto.job_id" => maps:get(job_id, Metadata, 0),
+            ~"shigoto.worker" => to_binary(maps:get(worker, Metadata, <<>>)),
+            ~"shigoto.attempt" => maps:get(attempt, Metadata, 0)
+        }
+    }),
+    otel_span:set_status(Ctx, ?OTEL_STATUS_ERROR, <<"discarded">>),
+    otel_span:end_span(Ctx);
+
+handle_event([shigoto, job, cancelled], _Measurements, Metadata, _Opts) ->
+    Tracer = tracer(),
+    Ctx = otel_tracer:start_span(Tracer, <<"shigoto.job.cancel">>, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => #{
+            ~"shigoto.job_id" => maps:get(job_id, Metadata, 0),
+            ~"shigoto.worker" => to_binary(maps:get(worker, Metadata, <<>>))
+        }
+    }),
+    otel_span:end_span(Ctx);
+
+handle_event([shigoto, queue, poll], Measurements, Metadata, _Opts) ->
+    Tracer = tracer(),
+    Ctx = otel_tracer:start_span(Tracer, <<"shigoto.queue.poll">>, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => #{
+            ~"shigoto.queue" => maps:get(queue, Metadata, <<>>),
+            ~"shigoto.claimed" => maps:get(claimed, Measurements, 0)
+        }
+    }),
+    otel_span:end_span(Ctx);
+
+handle_event([shigoto, queue, paused], _Measurements, Metadata, _Opts) ->
+    Tracer = tracer(),
+    Ctx = otel_tracer:start_span(Tracer, <<"shigoto.queue.pause">>, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => #{~"shigoto.queue" => maps:get(queue, Metadata, <<>>)}
+    }),
+    otel_span:end_span(Ctx);
+
+handle_event([shigoto, queue, resumed], _Measurements, Metadata, _Opts) ->
+    Tracer = tracer(),
+    Ctx = otel_tracer:start_span(Tracer, <<"shigoto.queue.resume">>, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => #{~"shigoto.queue" => maps:get(queue, Metadata, <<>>)}
+    }),
+    otel_span:end_span(Ctx);
+
+handle_event([shigoto, resilience, rate_limited], Measurements, Metadata, _Opts) ->
+    Tracer = tracer(),
+    Ctx = otel_tracer:start_span(Tracer, <<"shigoto.resilience.rate_limited">>, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => #{
+            ~"shigoto.worker" => to_binary(maps:get(worker, Metadata, <<>>)),
+            ~"shigoto.retry_after_ms" => maps:get(retry_after_ms, Measurements, 0)
+        }
+    }),
+    otel_span:end_span(Ctx);
+
+handle_event([shigoto, resilience, circuit_open], _Measurements, Metadata, _Opts) ->
+    Tracer = tracer(),
+    Ctx = otel_tracer:start_span(Tracer, <<"shigoto.resilience.circuit_open">>, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => #{~"shigoto.worker" => to_binary(maps:get(worker, Metadata, <<>>))}
+    }),
+    otel_span:set_status(Ctx, ?OTEL_STATUS_ERROR, <<"circuit_open">>),
+    otel_span:end_span(Ctx);
+
+handle_event([shigoto, resilience, bulkhead_full], _Measurements, Metadata, _Opts) ->
+    Tracer = tracer(),
+    Ctx = otel_tracer:start_span(Tracer, <<"shigoto.resilience.bulkhead_full">>, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => #{~"shigoto.worker" => to_binary(maps:get(worker, Metadata, <<>>))}
+    }),
+    otel_span:end_span(Ctx);
+
+handle_event([shigoto, resilience, load_shed], _Measurements, Metadata, _Opts) ->
+    Tracer = tracer(),
+    Ctx = otel_tracer:start_span(Tracer, <<"shigoto.resilience.load_shed">>, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => #{~"shigoto.priority" => maps:get(priority, Metadata, 0)}
+    }),
+    otel_span:end_span(Ctx);
+
+handle_event([shigoto, batch, completed], _Measurements, Metadata, _Opts) ->
+    Tracer = tracer(),
+    Ctx = otel_tracer:start_span(Tracer, <<"shigoto.batch.complete">>, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => #{
+            ~"shigoto.batch_id" => maps:get(batch_id, Metadata, 0),
+            ~"shigoto.total_jobs" => maps:get(total_jobs, Metadata, 0),
+            ~"shigoto.completed_jobs" => maps:get(completed_jobs, Metadata, 0),
+            ~"shigoto.discarded_jobs" => maps:get(discarded_jobs, Metadata, 0)
+        }
+    }),
+    otel_span:end_span(Ctx);
+
+handle_event([shigoto, cron, scheduled], _Measurements, Metadata, _Opts) ->
+    Tracer = tracer(),
+    Ctx = otel_tracer:start_span(Tracer, <<"shigoto.cron.schedule">>, #{
+        kind => ?SPAN_KIND_INTERNAL,
+        attributes => #{
+            ~"shigoto.cron.name" => to_binary(maps:get(name, Metadata, <<>>)),
+            ~"shigoto.worker" => to_binary(maps:get(worker, Metadata, <<>>)),
+            ~"shigoto.cron.schedule" => maps:get(schedule, Metadata, <<>>)
+        }
+    }),
+    otel_span:end_span(Ctx);
+
+handle_event(_Event, _Measurements, _Metadata, _Opts) ->
     ok.
-
-%%----------------------------------------------------------------------
-%% Helpers
-%%----------------------------------------------------------------------
-
--doc "Build span name from operation and worker metadata.".
--spec span_name(binary(), map()) -> binary().
-span_name(Operation, #{worker := Worker}) ->
-    WorkerBin = format_worker(Worker),
-    <<"shigoto.job.", Operation/binary, " ", WorkerBin/binary>>;
-span_name(Operation, _) ->
-    <<"shigoto.job.", Operation/binary>>.
-
--doc "Format a worker name to binary.".
--spec format_worker(atom() | binary()) -> binary().
-format_worker(Worker) when is_atom(Worker) ->
-    atom_to_binary(Worker, utf8);
-format_worker(Worker) when is_binary(Worker) ->
-    Worker;
-format_worker(_) ->
-    <<"unknown">>.
 
 %%----------------------------------------------------------------------
 %% Internal
 %%----------------------------------------------------------------------
 
-job_attributes(Metadata, Config) ->
-    JobSystem = maps:get(job_system, Config, <<"shigoto">>),
+tracer() ->
+    opentelemetry:get_application_tracer(?MODULE).
+
+span_name(Base, Metadata, Opts) ->
+    Prefix = maps:get(span_prefix, Opts, <<"shigoto">>),
+    Worker = to_binary(maps:get(worker, Metadata, <<>>)),
+    case Worker of
+        <<>> -> <<Prefix/binary, ".", Base/binary>>;
+        _ -> <<Prefix/binary, ".", Base/binary, " ", Worker/binary>>
+    end.
+
+job_attributes(Metadata, Measurements) ->
     #{
-        'shigoto.system' => JobSystem,
-        'shigoto.job.id' => maps:get(job_id, Metadata, undefined),
-        'shigoto.job.worker' => format_worker(maps:get(worker, Metadata, undefined)),
-        'shigoto.job.queue' => maps:get(queue, Metadata, undefined),
-        'shigoto.job.attempt' => maps:get(attempt, Metadata, 0)
+        ~"shigoto.job_id" => maps:get(job_id, Metadata, 0),
+        ~"shigoto.worker" => to_binary(maps:get(worker, Metadata, <<>>)),
+        ~"shigoto.queue" => maps:get(queue, Metadata, <<>>),
+        ~"shigoto.attempt" => maps:get(attempt, Metadata, 0),
+        ~"shigoto.priority" => maps:get(priority, Metadata, 0),
+        ~"shigoto.duration_ms" => maps:get(duration_ms, Measurements, 0),
+        ~"shigoto.queue_wait_ms" => maps:get(queue_wait_ms, Measurements, 0)
     }.
 
-format_error(Reason) when is_binary(Reason) ->
-    Reason;
-format_error(Reason) ->
-    iolist_to_binary(io_lib:format("~0p", [Reason])).
+to_binary(V) when is_binary(V) -> V;
+to_binary(V) when is_atom(V) -> atom_to_binary(V);
+to_binary(V) when is_list(V) -> list_to_binary(V);
+to_binary(V) -> iolist_to_binary(io_lib:format("~p", [V])).
